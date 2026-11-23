@@ -3,8 +3,12 @@
 RAW 拜耳 -> 彩色成品图
 
 两个独立阶段：
-  ① 解拜耳 Demosaic = 数学插值，把每个像素只有一种颜色的拜耳数据还原成 RGB（答案唯一）
+  ① 解拜耳 Demosaic = 数学插值，把每个像素只有一种颜色的拜耳数据还原成 RGB
   ② 调色 Color grading = 白平衡 / 高光压缩 / 对比 / 饱和（审美判断，无标准答案）
+
+解拜耳用「方向自适应绿 + 色差插值」的浮点实现（不再用 cv2.cvtColor 的双线性）：
+  双线性只做 3x3 平均，边缘上 R/B 与 G 会错开约 1 像素，于是出现彩色拉链/锯齿，
+  且有效分辨率下降。方向自适应会沿着边缘插值，色差插值再保证 R-G/B-G 平滑。
 
 依赖：
   pip install numpy opencv-python pillow
@@ -26,9 +30,20 @@ RAW 拜耳 -> 彩色成品图
   --sat      饱和度（1 = 原样，2 = 加倍）
   --vibrance 智能饱和：只增强有颜色的地方，灰色保持干净（0~1）
   --warm     色温，>1 偏暖，<1 偏冷（本例 1.04）
+  --denoise  色度降噪（0=关，3=轻，5=强）。只动 R-G/B-G，不动亮度，默认 5
+  --out-bit  输出位深 8 或 16。16 保留完整动态范围（文件约 3 倍大），默认 8
+  --resize   输出前把长边缩到 N（INTER_AREA）。别让看图软件去缩 3840 的图，
+             廉价缩放会在硬边上产生彩色锯齿
+
+命名注意：
+  BAYER_CODES 里的「标签 -> OpenCV 常量」是现场实测标定的，与 OpenCV 官方文档的
+  Bayer 命名正好相反（官方 BayerBG 指 RGGB，这里 RGGB 用 BayerRG）。
+  换机器/换传感器时若颜色 R/B 互换，先怀疑这里，而不是调 --warm。
 """
 
 import argparse
+import time
+
 import numpy as np
 import cv2
 from PIL import Image
@@ -57,12 +72,109 @@ def load_raw(path, w, h, bit, stride=None):
     return a.astype(np.float32)
 
 
-def demosaic(linear, bayer):
-    """① 解拜耳：把马赛克插值成每个像素的完整 RGB。"""
-    return cv2.cvtColor(np.clip(linear, 0, 65535).astype(np.uint16),
-                        BAYER_CODES[bayer.upper()]).astype(np.float32)
+# ----------------------------------------------------------------------------
+# 解拜耳
+# ----------------------------------------------------------------------------
+def _cfa_layout(label):
+    """标签 -> 直觉 2x2 布局（'GBRG' = 第0行 G,B / 第1行 R,G）。
+
+    BAYER_CODES 的标签与 OpenCV 官方命名相反，所以这里把 R/B 互换一次，
+    得到真正的传感器排布。已用合成图对 4 种排列逐一验证。
+    """
+    return label.upper().translate(str.maketrans("RB", "BR"))
 
 
+def _channel_masks(cfa, h, w):
+    """三个通道各自的采样点掩码（1 = 该像素有这个颜色）。"""
+    m = np.zeros((3, h, w), np.float32)
+    for dy in (0, 1):
+        for dx in (0, 1):
+            c = "RGB".index(cfa[dy * 2 + dx])
+            m[c, dy::2, dx::2] = 1.0
+    return m
+
+
+def _gain_map(shape, cfa, gains):
+    """每个像素按其通道取对应增益。"""
+    h, w = shape
+    gm = np.empty((h, w), np.float32)
+    for dy in (0, 1):
+        for dx in (0, 1):
+            gm[dy::2, dx::2] = gains["RGB".index(cfa[dy * 2 + dx])]
+    return gm
+
+
+def _shift(a, dy, dx, pad=2):
+    """带边缘复制的平移（避免 np.roll 的环绕）。"""
+    return a[pad + dy:pad + dy + a.shape[0] - 2 * pad,
+             pad + dx:pad + dx + a.shape[1] - 2 * pad]
+
+
+def _demosaic_float(mos, cfa):
+    """方向自适应绿(Hamilton-Adams) + 色差插值，输入/输出均为浮点。"""
+    h, w = mos.shape
+    pad = 2
+    mp = np.pad(mos, pad, mode="edge")
+    masks = _channel_masks(cfa, h, w)
+    mG = masks[1]
+    Gp = np.pad(mos * mG, pad, mode="edge")
+    S = lambda a, dy, dx: _shift(a, dy, dx, pad)
+
+    C = mp[pad:pad + h, pad:pad + w]
+    gl, gr = S(Gp, 0, -1), S(Gp, 0, 1)
+    gu, gd = S(Gp, -1, 0), S(Gp, 1, 0)
+    h2 = S(mp, 0, -2) + S(mp, 0, 2)
+    v2 = S(mp, -2, 0) + S(mp, 2, 0)
+
+    # 梯度小的一侧更可信；修正项用同色 ±2 的二阶差分，天然无直流偏移
+    dH = np.abs(gl - gr) + np.abs(2 * C - h2)
+    dV = np.abs(gu - gd) + np.abs(2 * C - v2)
+    Gh = 0.5 * (gl + gr) + 0.25 * (2 * C - h2)
+    Gv = 0.5 * (gu + gd) + 0.25 * (2 * C - v2)
+    G = np.where(mG > 0, C, np.where(dH <= dV, Gh, Gv))
+
+    # 色差 (R-G)/(B-G) 平滑插值：等色相假设，边缘不会出现彩色拉链
+    k = np.array([[1, 2, 1], [2, 4, 2], [1, 2, 1]], np.float32) / 16
+
+    def nconv(sparse, mask):
+        den = cv2.filter2D(mask, -1, k)
+        return cv2.filter2D(sparse * mask, -1, k) / np.maximum(den, 1e-6)
+
+    Rc = nconv(np.where(masks[0] > 0, mos - G, 0), masks[0])
+    Bc = nconv(np.where(masks[2] > 0, mos - G, 0), masks[2])
+    R = np.where(masks[0] > 0, mos, G + Rc)
+    B = np.where(masks[2] > 0, mos, G + Bc)
+    return np.clip(np.dstack([R, G, B]), 0, None).astype(np.float32)
+
+
+def _denoise_chroma(rgb, ksize):
+    """只对色差做中值滤波：彩色噪点消失，亮度细节原样保留。"""
+    if ksize < 3:
+        return rgb
+    g = rgb[:, :, 1]
+    rg = cv2.medianBlur(rgb[:, :, 0] - g, ksize)
+    bg = cv2.medianBlur(rgb[:, :, 2] - g, ksize)
+    return np.dstack([g + rg, g, g + bg])
+
+
+def demosaic(linear, bayer, gains=None, denoise=5):
+    """① 解拜耳：把马赛克插值成每个像素的完整 RGB（浮点，保持 16bit 精度）。
+
+    gains 给出时先做白平衡再插值：三个通道量级一致，方向判断和色差插值才准。
+    返回的 rgb 已乘好增益（未做 gamma/白点）。
+    """
+    if gains is None:  # 兼容旧调用：退回双线性
+        return cv2.cvtColor(np.clip(linear, 0, 65535).astype(np.uint16),
+                            BAYER_CODES[bayer.upper()]).astype(np.float32)
+    cfa = _cfa_layout(bayer)
+    gains = np.asarray(gains, np.float32)
+    rgb = _demosaic_float(linear * _gain_map(linear.shape, cfa, gains), cfa)
+    return _denoise_chroma(rgb, denoise)
+
+
+# ----------------------------------------------------------------------------
+# 调色
+# ----------------------------------------------------------------------------
 def wb_gains(rgb, patches, warm):
     """②a 白平衡：用中性区（应呈白/灰的面）反推三通道增益。"""
     if patches:
@@ -79,10 +191,9 @@ def wb_gains(rgb, patches, warm):
     return gains / gains.mean()
 
 
-def grade(rgb, white, shoulder, contrast, sat, vibrance, gains, gamma=2.2):
-    """②b 调色：高光软肩 -> gamma -> S 曲线对比 -> 饱和 + vibrance。"""
-    c = rgb * gains[None, None, :]
-    x = np.clip(c / white, 0, None)
+def grade(rgb, white, shoulder, contrast, sat, vibrance, gamma=2.2):
+    """②b 调色：高光软肩 -> gamma -> S 曲线对比 -> 饱和 + vibrance。返回 0~1 浮点。"""
+    x = np.clip(rgb / white, 0, None)
     # 关键：white 直接映射到 1.0。切勿再除以全图 max，否则整体被压暗压灰。
     x = x * (1 + shoulder) / (1 + x * shoulder)
     x = np.clip(x, 0, 1)
@@ -96,7 +207,20 @@ def grade(rgb, white, shoulder, contrast, sat, vibrance, gains, gamma=2.2):
     mx, mn = out.max(2), out.min(2)
     chroma = (mx - mn) / (mx + 1e-6)
     out = l + (out - l) * (1 + vibrance * (1 - chroma))[:, :, None]
-    return (np.clip(out, 0, 1) * 255).astype(np.uint8)
+    return np.clip(out, 0, 1).astype(np.float32)
+
+
+def save_png(rgb01, path, bit=8):
+    """8bit 四舍五入（不是截断）；16bit 用 OpenCV 编码后写盘，避开中文路径。"""
+    if bit == 16:
+        u16 = (np.clip(rgb01, 0, 1) * 65535.0 + 0.5).astype(np.uint16)
+        ok, buf = cv2.imencode(".png", u16[:, :, ::-1])
+        if not ok:
+            raise IOError("PNG 编码失败")
+        with open(path, "wb") as f:
+            f.write(buf.tobytes())
+    else:
+        Image.fromarray((np.clip(rgb01, 0, 1) * 255.0 + 0.5).astype(np.uint8)).save(path)
 
 
 def main():
@@ -122,6 +246,13 @@ def main():
     ap.add_argument("--vibrance", type=float, default=1.0, help="智能饱和 0~1")
     ap.add_argument("--gamma", type=float, default=2.2, help="gamma，越小整体越亮（不剪高光）")
     ap.add_argument("--warm", type=float, default=1.04, help="色温 >1 暖 <1 冷")
+    ap.add_argument("--denoise", type=int, default=5, choices=[0, 3, 5],
+                    help="色度降噪 0/3/5：越大彩色噪点越少，默认 5")
+    ap.add_argument("--out-bit", type=int, default=8, choices=[8, 16],
+                    help="输出位深：8 通用；16 保留完整动态范围，默认 8")
+    ap.add_argument("--resize", type=int, default=0, metavar="N",
+                    help="输出前把长边缩到 N 像素（INTER_AREA，自带抗锯齿）。"
+                         "看图时别让看图软件去缩 3840 的图，那样会出彩边/锯齿")
     ap.add_argument("--neutral", action="append", default=[], metavar="X0,Y0,X1,Y1",
                     help="中性区矩形，可指定多次；不指定则用亮部灰世界")
     a = ap.parse_args()
@@ -131,23 +262,39 @@ def main():
         x0, y0, x1, y1 = map(int, spec.split(","))
         patches.append((x0, y0, x1, y1))
 
+    t0 = time.time()
     raw = load_raw(a.input, a.w, a.h, a.bit, a.stride)
     linear = np.clip(raw - a.black, 0, None)
-    rgb = demosaic(linear, a.bayer)
+
+    # 白平衡增益与白点沿用原来的双线性结果来估计：保证换解拜耳前后
+    # 画面的整体亮度和色温跟旧版一致，不用重新调参。
+    ref = cv2.cvtColor(np.clip(linear, 0, 65535).astype(np.uint16),
+                       BAYER_CODES[a.bayer.upper()]).astype(np.float32)
     white = a.white
     if a.auto_white is not None:
-        white = float(np.percentile(rgb.max(2), a.auto_white))
+        white = float(np.percentile(ref.max(2), a.auto_white))
     if a.ae is not None:
-        white = float(a.ae) * float(np.median(rgb.mean(2)))
-    gains = wb_gains(rgb, patches, a.warm)
-    result = grade(rgb, white, a.shoulder, a.contrast,
-                   a.sat, a.vibrance, a.warm and gains, a.gamma)
-    Image.fromarray(result).save(a.output)
+        white = float(a.ae) * float(np.median(ref.mean(2)))
+    gains = wb_gains(ref, patches, a.warm)
+    del ref
 
-    print(f"拜耳={a.bayer.upper()} 黑电平={a.black} 白点={white}"
+    rgb = demosaic(linear, a.bayer, gains, a.denoise)
+    result = grade(rgb, white, a.shoulder, a.contrast, a.sat, a.vibrance, a.gamma)
+    if a.resize and a.resize < max(result.shape[:2]):
+        h, w = result.shape[:2]
+        s = a.resize / float(max(h, w))
+        result = cv2.resize(result, (max(1, int(round(w * s))), max(1, int(round(h * s)))),
+                            interpolation=cv2.INTER_AREA)
+    save_png(result, a.output, a.out_bit)
+
+    blown = float((result >= 0.999).all(2).mean())
+    print(f"拜耳={a.bayer.upper()} 黑电平={a.black} 白点={white:.0f}"
           + (f" (自动 p{a.auto_white})" if a.auto_white is not None else ""))
-    print(f"白平衡增益 RGB={gains.round(3)}")
-    print(f"已保存 {a.output}  {a.w}x{a.h}")
+    print(f"白平衡增益 RGB={gains.round(3)}  色度降噪={a.denoise}  输出={a.out_bit}bit")
+    if blown > 0.02:
+        print(f"[提示] {blown:.1%} 的像素已压成纯白（高光细节丢失）；"
+              f"可把 --ae 调大或 --white 调大")
+    print(f"已保存 {a.output}  {result.shape[1]}x{result.shape[0]}  耗时 {time.time() - t0:.1f}s")
 
 
 if __name__ == "__main__":
