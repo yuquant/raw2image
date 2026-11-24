@@ -30,6 +30,8 @@ RAW 拜耳 -> 彩色成品图
   --sat      饱和度（1 = 原样，2 = 加倍）
   --vibrance 智能饱和：只增强有颜色的地方，灰色保持干净（0~1）
   --warm     色温，>1 偏暖，<1 偏冷（本例 1.04）
+  --wb-gain  直接固定白平衡增益 R,G,B（覆盖 --neutral/--warm）。一批片子同灯同场景时
+             用它，否则 --neutral 的矩形会落到不同物体上，整批颜色忽黄忽蓝
   --denoise  色度降噪（0=关，3=轻，5=强）。只动 R-G/B-G，不动亮度，默认 5
   --out-bit  输出位深 8 或 16。16 保留完整动态范围（文件约 3 倍大），默认 8
   --resize   输出前把长边缩到 N（INTER_AREA）。别让看图软件去缩 3840 的图，
@@ -255,6 +257,10 @@ def main():
                          "看图时别让看图软件去缩 3840 的图，那样会出彩边/锯齿")
     ap.add_argument("--neutral", action="append", default=[], metavar="X0,Y0,X1,Y1",
                     help="中性区矩形，可指定多次；不指定则用亮部灰世界")
+    ap.add_argument("--wb-gain", default=None, metavar="R,G,B",
+                    help="直接给定白平衡增益（覆盖 --neutral / --warm）。"
+                         "整批同一场景、同一盏灯时用它：批内每张的 WB 才一致，"
+                         "否则 --neutral 落在不同物体上，整批颜色会忽黄忽蓝")
     a = ap.parse_args()
 
     patches = []
@@ -275,7 +281,13 @@ def main():
         white = float(np.percentile(ref.max(2), a.auto_white))
     if a.ae is not None:
         white = float(a.ae) * float(np.median(ref.mean(2)))
-    gains = wb_gains(ref, patches, a.warm)
+    if a.wb_gain:
+        gains = np.array([float(v) for v in a.wb_gain.split(",")], np.float32)
+        if gains.size != 3 or not np.all(gains > 0):
+            raise SystemExit("--wb-gain 需要 3 个正数，例如 --wb-gain 1.53,0.62,0.85")
+        gains = gains / gains.mean()
+    else:
+        gains = wb_gains(ref, patches, a.warm)
     del ref
 
     rgb = demosaic(linear, a.bayer, gains, a.denoise)

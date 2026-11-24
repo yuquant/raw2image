@@ -36,6 +36,21 @@ set "OUT=%~2"
 if "%OUT%"=="" set "OUT=%~dp0"
 if "!OUT:~-1!"=="\" set "OUT=!OUT:~0,-1!"
 
+rem  ------------------------------------------------------------
+rem  调色参数（人像白平衡标定，20261124 这一批客厅钨丝灯 + 窗光）
+rem
+rem  --wb-gain 1.53,0.62,0.85
+rem      由画面里那件白 T 恤标定出来的白平衡增益。整批 12 个机位都适用。
+rem      以前用的 --neutral 1200,2700,2600,3400 在人物照里压到了蓝色椅子上
+rem      (该区域实测 R/G=0.34, B/G=0.76)，等于把蓝色当白点，
+rem      于是 R 增益被算成 1.74、G 只有 0.56 -> 人脸整片橙黄。
+rem      换灯/换房间/换相机必须重标：把 --neutral 打在一块"同光源下的白/灰面"上，
+rem      看脚本打印的 白平衡增益 RGB，再把它填回 --wb-gain。
+rem  --warm 1.00   1.04 等于再往上加 4% 红、减 4% 蓝，会加重发黄
+rem  --sat 1.5     原来 2.0：饱和度 ×2 会把皮肤的黄橙一起放大
+rem  --vibrance 0.3  原来 1.0：低饱和区（皮肤正好在这个区间）被额外加倍
+rem  ------------------------------------------------------------
+
 if not exist "%PY%" (
     echo [错误] 找不到 uv 虚拟环境: %PY%
     echo 请先执行:
@@ -86,8 +101,8 @@ for %%f in ("%SRC%\*.RawPlain16LSB1") do (
     "%PY%" "%~dp0raw_bayer_to_image.py" "%%f" ^
         -o "%OUT%\%%~nf.png" ^
         --w 3840 --h 3840 --stride 7680 --bayer GBRG ^
-        --black 60 --ae 8 --shoulder 0.20 --contrast 0.75 --sat 2.0 --vibrance 1.0 --warm 1.04 ^
-        --neutral 1200,2700,2600,3400
+        --black 60 --ae 8 --shoulder 0.20 --contrast 0.75 --sat 1.5 --vibrance 0.3 --warm 1.00 ^
+        --wb-gain 1.53,0.62,0.85
     if errorlevel 1 (
         set /a FAIL+=1
         echo    [失败] %%~nxf
